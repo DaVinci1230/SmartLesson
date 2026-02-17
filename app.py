@@ -37,6 +37,20 @@ from typing import Dict, Tuple, Any
 logger = logging.getLogger(__name__)
 
 # ======================================================
+# SECRETS HELPERS
+# ======================================================
+def get_gemini_api_key() -> str | None:
+    """Safely read GEMINI_API_KEY from Streamlit secrets or environment."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        # Streamlit raises when secrets.toml is missing
+        pass
+
+    return os.environ.get("GEMINI_API_KEY")
+
+# ======================================================
 # INITIALIZE QUESTION API SERVICE
 # ======================================================
 question_api = QuestionAPIService(storage_backend='session_state')
@@ -207,14 +221,20 @@ with main_tabs[1]:
             # Get the selected exam_term
             selected_exam_term = st.session_state.course_details.get("exam_term", "Midterm")
             
+            # Check if exam_term has changed - if so, re-extract learning outcomes
+            outcomes_need_refresh = (
+                "extracted_exam_term" not in st.session_state or 
+                st.session_state.extracted_exam_term != selected_exam_term
+            )
+            
             with st.spinner(f"📖 Extracting syllabus details for {selected_exam_term}... (Optimized)"):
                 # Use cached extraction with exam_term parameter
                 extracted = cached_extract_syllabus(pdf_bytes, exam_term=selected_exam_term)
                 
                 if "error" not in extracted:
-                    # Check if already processed (don't reprocess)
-                    if "pdf_processing_done" not in st.session_state:
-                        # Update session state with extracted data - ONLY ONCE
+                    # Check if already processed (don't reprocess) - BUT DO refresh if exam_term changed
+                    if "pdf_processing_done" not in st.session_state or outcomes_need_refresh:
+                        # Update session state with extracted data - ONLY ONCE (or when exam_term changes)
                         st.session_state.course_details["course_code"] = extracted.get("course_code", "")
                         st.session_state.course_details["course_title"] = extracted.get("course_title", "")
                         st.session_state.course_details["semester"] = extracted.get("semester", "1st") or "1st"
@@ -223,6 +243,7 @@ with main_tabs[1]:
                         
                         # Store learning outcomes for the next tab
                         st.session_state.extracted_learning_outcomes = extracted.get("learning_outcomes", [])
+                        st.session_state.extracted_exam_term = selected_exam_term  # NEW: Track which exam_term these outcomes are for
                         st.session_state.pdf_processing_done = True
                     
                     st.success("✅ Syllabus details extracted successfully!")
@@ -305,6 +326,23 @@ with assess_tabs[1]:
     if "assessment_outcomes" not in st.session_state:
         st.session_state.assessment_outcomes = []
 
+    # ---------------------------------
+    # NEW: SHOW THE EXAM TERM BEING USED
+    # ---------------------------------
+    current_exam_term = st.session_state.course_details.get("exam_term", "Midterm")
+    extracted_exam_term = st.session_state.get("extracted_exam_term", None)
+    
+    if extracted_exam_term:
+        if extracted_exam_term == current_exam_term:
+            st.success(f"✅ Using learning outcomes from: **{current_exam_term}**")
+        else:
+            st.warning(
+                f"⚠️ **Mismatch!** Learning outcomes are from **{extracted_exam_term}**, "
+                f"but you selected **{current_exam_term}**. "
+                f"Go back to Course/Syllabus tab, change back to {extracted_exam_term}, "
+                f"and upload the PDF again to extract correct outcomes."
+            )
+    
     # ---------------------------------
     # AUTO-IMPORT FROM PDF (if available)
     # ---------------------------------
@@ -774,9 +812,50 @@ with assess_tabs[3]:
         st.markdown("### Bloom’s Level Totals")
         st.json(result["bloom_totals"])
 
+    # Quick export after TOS generation
+    if "generated_tos" in st.session_state:
+        st.markdown("#### 📥 Export TOS")
+        if st.button("⬇ Export TOS as Excel", key="btn_export_tos_generate_tab"):
 
-    # --- Generate TQS ---
-    with assess_tabs[4]:
+            exam_term = st.session_state.course_details.get("exam_term", "Midterm")
+            course_code = st.session_state.course_details.get("course_code", "")
+            course_title = st.session_state.course_details.get("course_title", "")
+            semester = st.session_state.course_details.get("semester", "")
+            instructor = st.session_state.course_details.get("instructor", "")
+            academic_year = st.session_state.course_details.get("academic_year", "")
+
+            total_points = st.session_state.generated_tos.get("total_points", 0)
+
+            excel = export_tos_exact_format(
+                meta={
+                    "name": instructor,
+                    "subject_code": course_code,
+                    "title": course_title,
+                    "semester": semester,
+                    "exam_term": exam_term,
+                    "academic_year": academic_year,
+                    "schedule": "",
+                    "course": "",
+                    "exam_date": "",
+                    "course_content": ""
+                },
+                outcomes=st.session_state.generated_tos["outcomes"],
+                tos_matrix=st.session_state.generated_tos["tos_matrix"],
+                total_items=st.session_state.generated_tos.get("total_items", 0),
+                total_points=int(total_points)
+            )
+
+            file_name = f"TOS_{course_code}_{exam_term}.xlsx"
+            st.download_button(
+                label="📥 Download TOS Excel",
+                data=excel,
+                file_name=file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+
+# --- Generate TQS ---
+with assess_tabs[4]:
         st.markdown("### Generate Test Questions (TQS)")
 
         st.write("Generate actual test questions from your exam blueprint using AI.")
@@ -838,6 +917,9 @@ with assess_tabs[3]:
                     return False, f"Distribution items ({total_slots_in_dist}) must equal TOS total ({total_slots_needed})"
                 
                 outcomes = tos_data.get("learning_outcomes", [])
+                if not outcomes:
+                    # Support in-app generated TOS structure
+                    outcomes = tos_data.get("outcomes", [])
                 tos_matrix = tos_data.get("tos_matrix", {})
                 
                 # Create a list of all type slots based on distribution
@@ -1174,12 +1256,8 @@ with assess_tabs[3]:
                 st.error("❌ No TOS available. Please select or upload a TOS first.")
                 st.stop()
             
-            # Check API key (try Streamlit secrets first, then environment variable)
-            api_key = None
-            if hasattr(st, 'secrets') and 'GEMINI_API_KEY' in st.secrets:
-                api_key = st.secrets['GEMINI_API_KEY']
-            else:
-                api_key = os.environ.get("GEMINI_API_KEY")
+            # Check API key (Streamlit secrets or environment variable)
+            api_key = get_gemini_api_key()
             
             if not api_key:
                 st.error("❌ GEMINI_API_KEY is not configured. Please add it to Streamlit secrets or environment variables.")
@@ -1459,12 +1537,8 @@ with assess_tabs[3]:
                                 st.error("❌ Failed to update question.")
                         
                         if regen_btn:
-                            # Get API key (try Streamlit secrets first, then environment variable)
-                            api_key = None
-                            if hasattr(st, 'secrets') and 'GEMINI_API_KEY' in st.secrets:
-                                api_key = st.secrets['GEMINI_API_KEY']
-                            else:
-                                api_key = os.environ.get("GEMINI_API_KEY")
+                            # Get API key (Streamlit secrets or environment variable)
+                            api_key = get_gemini_api_key()
                             
                             if not api_key:
                                 st.error("❌ GEMINI_API_KEY is not configured.")
@@ -1483,8 +1557,8 @@ with assess_tabs[3]:
                             else:
                                 st.error("❌ Failed to delete question.")
 
-    # --- Export ---
-    with assess_tabs[5]:
+# --- Export ---
+with assess_tabs[5]:
         st.markdown("### Export")
         
         # Display current TOS settings

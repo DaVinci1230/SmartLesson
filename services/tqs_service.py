@@ -538,10 +538,28 @@ Return ONLY the JSON array, with NO other text."""
         logger.info(f"✓ Parsed {len(json_array)} questions from API response")
         
         # =====================================================================
+        # CRITICAL CHECK: Verify we got the expected number of questions
+        # =====================================================================
+        expected_count = len(batch_slots)
+        actual_count = len(json_array)
+        
+        if actual_count != expected_count:
+            logger.error(
+                f"❌ BATCH QUESTION COUNT MISMATCH!\n"
+                f"   Expected: {expected_count} questions\n"
+                f"   Got: {actual_count} questions\n"
+                f"   Missing: {expected_count - actual_count} questions\n"
+                f"This indicates the API did not return the requested number of questions."
+            )
+            # Return empty list to trigger retry with exponential backoff
+            return []
+        
+        # =====================================================================
         # MERGE WITH SLOT METADATA
         # =====================================================================
         
         generated_questions = []
+        logger.info(f"Merging {len(json_array)} API questions with {len(batch_slots)} slot definitions...")
         
         for idx, (json_question, slot) in enumerate(zip(json_array, batch_slots)):
             if not isinstance(json_question, dict):
@@ -585,7 +603,7 @@ Return ONLY the JSON array, with NO other text."""
                 logger.error(f"Error merging question {idx}: {e}")
                 continue
         
-        logger.info(f"✓ Successfully generated {len(generated_questions)} questions from batch")
+        logger.info(f"✓ Successfully merged {len(generated_questions)} questions from batch")
         return generated_questions
     
     except Exception as e:
@@ -1355,7 +1373,15 @@ def generate_tqs(
     # PHASE 1: GROUP SLOTS AND GENERATE QUESTIONS (using batch API calls)
     # =========================================================================
     
+    logger.info("="*80)
     logger.info("PHASE 1: Batch Generation (reduced API calls)")
+    logger.info("="*80)
+    
+    # Store expected count BEFORE generation - THIS IS CRITICAL FOR DEBUGGING
+    expected_question_count = len(assigned_slots)
+    logger.info(f"📊 EXPECTED QUESTIONS: {expected_question_count} (from {expected_question_count} slots)")
+    logger.info(f"📊 EXPECTED TOTAL POINTS: {sum(s.get('points', 1) for s in assigned_slots)}")
+    
     logger.info(f"Grouping {len(assigned_slots)} slots by characteristics...")
     
     # Group slots by (question_type, bloom_level, learning_outcome)
@@ -1364,33 +1390,69 @@ def generate_tqs(
     logger.info(f"Created {len(groups)} groups for batch generation")
     logger.info(f"Expected API calls: {len(groups)} (reduction from {len(assigned_slots)} single calls)")
     
-    # Generate questions for each group
+    # Generate questions for each group with RETRY LOGIC
     generated_questions = []
     failed_groups = []
+    MAX_RETRIES = 2
     
     for group_num, (characteristics, batch_slots) in enumerate(groups.items(), 1):
         qtype, bloom, outcome = characteristics
+        num_slots = len(batch_slots)
         
         logger.info(f"\n[Group {group_num}/{len(groups)}] {qtype} / {bloom} / {str(outcome)[:40]}...")
-        logger.info(f"  Slots in group: {len(batch_slots)}")
+        logger.info(f"  Expected questions: {num_slots}")
         
-        try:
-            # Generate all questions in this batch with ONE API call
-            batch_questions = generate_batch_questions(batch_slots, api_key)
-            
-            if batch_questions:
-                generated_questions.extend(batch_questions)
+        batch_questions = None
+        last_error = None
+        
+        # Retry loop with exponential backoff
+        for retry_attempt in range(MAX_RETRIES + 1):
+            try:
+                # Generate all questions in this batch with ONE API call
+                batch_questions = generate_batch_questions(batch_slots, api_key)
+                
+                if not batch_questions:
+                    last_error = "generate_batch_questions returned empty list"
+                    logger.warning(f"  ⚠️  Attempt {retry_attempt + 1}/{MAX_RETRIES + 1}: Got 0 questions (expected {num_slots})")
+                    if retry_attempt < MAX_RETRIES:
+                        import time
+                        wait_time = 2 ** retry_attempt
+                        logger.info(f"  ⏳ Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    continue
+                
+                # CHECK: Verify we got the expected number of questions
+                if len(batch_questions) != num_slots:
+                    last_error = f"Expected {num_slots} questions, got {len(batch_questions)}"
+                    logger.error(f"  ❌ Attempt {retry_attempt + 1}/{MAX_RETRIES + 1}: {last_error} - THIS IS A BUG!")
+                    if retry_attempt < MAX_RETRIES:
+                        import time
+                        wait_time = 2 ** retry_attempt
+                        logger.info(f"  ⏳ Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    continue
+                
+                # Success!
                 logger.info(f"  ✓ Generated {len(batch_questions)} questions")
-            else:
-                failed_groups.append((characteristics, batch_slots, "generate_batch_questions returned empty"))
-                logger.error(f"  ✗ Failed to generate batch (returned empty)")
+                generated_questions.extend(batch_questions)
+                break
+            
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {str(e)}"
+                last_error = error_msg
+                logger.warning(f"  ⚠️  Attempt {retry_attempt + 1}/{MAX_RETRIES + 1}: {error_msg}")
+                if retry_attempt < MAX_RETRIES:
+                    import time
+                    wait_time = 2 ** retry_attempt
+                    logger.info(f"  ⏳ Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                if DEVELOPMENT_MODE:
+                    logger.exception("Full traceback:")
         
-        except Exception as e:
-            error_msg = f"{type(e).__name__}: {str(e)}"
-            failed_groups.append((characteristics, batch_slots, error_msg))
-            logger.error(f"  ✗ Batch generation failed: {error_msg}")
-            if DEVELOPMENT_MODE:
-                logger.exception("Full traceback for batch:")
+        # After all retries, check if batch succeeded
+        if batch_questions is None or len(batch_questions) != num_slots:
+            failed_groups.append((characteristics, batch_slots, last_error))
+            logger.error(f"  ✗ BATCH FAILED after {MAX_RETRIES + 1} attempts")
     
     # Convert failed_groups to failed_slots format for compatibility
     failed_slots = []
@@ -1399,18 +1461,30 @@ def generate_tqs(
             failed_slots.append((slot_idx, slot, error_msg))
     
     # Report generation results
-    logger.info(f"\nGeneration Results:")
-    logger.info(f"  Total slots: {len(assigned_slots)}")
-    logger.info(f"  Successfully generated: {len(generated_questions)}")
-    logger.info(f"  Failed: {len(failed_slots)}")
+    logger.info(f"\n" + "="*80)
+    logger.info(f"GENERATION RESULTS (after all retries):")
+    logger.info(f"="*80)
+    logger.info(f"  Expected: {expected_question_count} questions")
+    logger.info(f"  Generated: {len(generated_questions)} questions")
+    logger.info(f"  Missing: {expected_question_count - len(generated_questions)} questions")
+    logger.info(f"  Failed batches: {len(failed_groups)}")
+    
+    if len(generated_questions) != expected_question_count:
+        logger.error(f"\n🔥 WARNING: Question count MISMATCH!")
+        logger.error(f"   Expected: {expected_question_count}")
+        logger.error(f"   Got: {len(generated_questions)}")
+        logger.error(f"   Missing: {expected_question_count - len(generated_questions)}")
     
     if failed_slots:
-        logger.warning(f"Failed to generate {len(failed_slots)} questions:")
-        for slot_idx, slot, error in failed_slots[:5]:  # Show first 5 failures
-            logger.warning(f"  - Slot {slot_idx}: {error}")
+        logger.error(f"\n❌ CRITICAL: {len(failed_slots)} questions were NOT generated:")
+        for slot_idx, slot, error in failed_slots[:10]:
+            outcome_text = str(slot.get('outcome_text', 'N/A'))[:40]
+            logger.error(
+                f"  - Slot {slot_idx}: {slot.get('question_type')} / {slot.get('bloom_level')} / {outcome_text}... ({error})"
+            )
         
-        if len(failed_slots) > 5:
-            logger.warning(f"  ... and {len(failed_slots) - 5} more failures")
+        if len(failed_slots) > 10:
+            logger.error(f"  ... and {len(failed_slots) - 10} more missing questions")
         
         # Only fail completely if no questions were generated
         if len(generated_questions) == 0:
@@ -1418,7 +1492,7 @@ def generate_tqs(
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         
-        logger.warning(f"Continuing with {len(generated_questions)} successfully generated questions")
+        logger.warning(f"\n⚠️  WARNING: Continuing with {len(generated_questions)}/{expected_question_count} questions (INCOMPLETE!)")
     
     # =========================================================================
     # PHASE 2: SHUFFLE (optional)
@@ -1435,27 +1509,78 @@ def generate_tqs(
         question["question_number"] = idx
     
     # =========================================================================
-    # PHASE 4: VERIFICATION
+    # PHASE 4: VERIFICATION & SAFETY CHECKS (CRITICAL)
     # =========================================================================
-    logger.info("Performing final verification...")
+    logger.info(f"\n" + "="*80)
+    logger.info("PHASE 4: FINAL VERIFICATION & SAFETY CHECKS")
+    logger.info(f"="*80)
     
-    # Verify counts
-    if len(generated_questions) != len(assigned_slots):
-        logger.warning(
-            f"Question count mismatch: expected {len(assigned_slots)}, "
-            f"got {len(generated_questions)}"
-        )
+    # CRITICAL SAFETY CHECK #1: Question count must match
+    logger.info(f"Checking question count: {len(generated_questions)} vs expected {expected_question_count}")
+    
+    count_mismatch = len(generated_questions) != expected_question_count
+    if count_mismatch:
+        missing_count = expected_question_count - len(generated_questions)
+        logger.error(f"\n🔥 CRITICAL MISMATCH DETECTED!")
+        logger.error(f"   Expected: {expected_question_count} questions")
+        logger.error(f"   Generated: {len(generated_questions)} questions")
+        logger.error(f"   MISSING: {missing_count} questions")
+        logger.error(f"\nThis indicates {missing_count} questions were lost during generation.")
+    else:
+        logger.info(f"✓ Question count matches: {len(generated_questions)} == {expected_question_count}")
+    
+    # CRITICAL SAFETY CHECK #2: Total points must match
+    expected_total_points = sum(s.get('points', 1) for s in assigned_slots)
+    actual_total_points = sum(q.get('points', 1) for q in generated_questions)
+    logger.info(f"Checking total points: {actual_total_points} vs expected {expected_total_points}")
+    
+    points_mismatch = actual_total_points != expected_total_points
+    if points_mismatch:
+        logger.warning(f"Points mismatch: expected {expected_total_points}, got {actual_total_points}")
+    else:
+        logger.info(f"✓ Total points matches: {actual_total_points} == {expected_total_points}")
     
     # Verify sequential numbering
     question_numbers = [q["question_number"] for q in generated_questions]
     expected_numbers = list(range(1, len(generated_questions) + 1))
     if question_numbers != expected_numbers:
-        logger.error("Questions not numbered sequentially!")
+        logger.error("Questions are NOT numbered sequentially!")
     else:
         logger.info(f"✓ Questions numbered sequentially: 1-{len(generated_questions)}")
     
+    # Log validation summary
+    logger.info(f"\n" + "-"*80)
+    logger.info(f"FINAL VERIFICATION SUMMARY:")
+    logger.info(f"-"*80)
+    logger.info(f"  Questions: {len(generated_questions)}/{expected_question_count} ({'✓ MATCH' if not count_mismatch else f'✗ MISMATCH ({missing_count} missing)'})")
+    logger.info(f"  Total Points: {actual_total_points}/{expected_total_points} ({'✓ MATCH' if not points_mismatch else '✗ MISMATCH'})")
+    logger.info(f"  Question types: {len(set(q.get('question_type') for q in generated_questions))} types")
+    logger.info(f"  Bloom levels: {len(set(q.get('bloom_level') for q in generated_questions))} levels")
+    logger.info(f"-"*80)
+    
     # Validate all required fields are present
     logger.info("Validating all questions have required metadata...")
+    
+    # ===== SAFETY ASSERTION: Guarantee counts match =====
+    if len(generated_questions) != expected_question_count:
+        missing = expected_question_count - len(generated_questions)
+        error_msg = (
+            f"\n🔥 ASSERTION FAILED: Question count mismatch!\n"
+            f"Expected: {expected_question_count} questions\n"
+            f"Got: {len(generated_questions)} questions\n"
+            f"Missing: {missing} questions\n\n"
+            f"This is a CRITICAL data integrity issue. The TQS is incomplete.\n"
+            f"See application logs above for details about which batches failed.\n"
+        )
+        logger.error(error_msg)
+        raise AssertionError(
+            f"Generated {len(generated_questions)} questions but expected {expected_question_count}. "
+            f"Missing {missing} questions. This indicates a generation failure. "
+            f"Review logs for details."
+        )
+    
+    logger.info(f"✓ ASSERTION PASSED: Generated {expected_question_count} questions as expected")
+    
     try:
         validate_tqs_before_stats(generated_questions)
     except ValueError as e:

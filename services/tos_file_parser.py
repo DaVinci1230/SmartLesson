@@ -762,6 +762,9 @@ class TOSFileParser:
 
         # Validate learning outcomes
         outcomes = tos_data.get("learning_outcomes", [])
+        if not outcomes:
+            # Support in-app generated TOS structure
+            outcomes = tos_data.get("outcomes", [])
         if not isinstance(outcomes, list) or not outcomes:
             raise TOSParsingError("learning_outcomes must be a non-empty list")
 
@@ -906,12 +909,31 @@ def convert_tos_to_assigned_slots(
     """
     try:
         outcomes = tos_data.get("learning_outcomes", [])
+        if not outcomes:
+            outcomes = tos_data.get("outcomes", [])
         tos_matrix = tos_data.get("tos_matrix", {})
+
+        if not outcomes:
+            return False, "No learning outcomes found in TOS"
+        if not tos_matrix:
+            return False, "No TOS matrix found"
+
+        total_slots = 0
+        for bloom_key, bloom_row in tos_matrix.items():
+            if isinstance(bloom_row, dict):
+                total_slots += sum(int(v) for v in bloom_row.values() if isinstance(v, (int, float)))
+        if total_slots == 0:
+            return False, "TOS contains no items (all slots are zero)"
 
         assigned_slots = []
 
         for bloom in BLOOM_LEVELS:
             bloom_row = tos_matrix.get(bloom, {})
+            if not bloom_row:
+                for key in tos_matrix.keys():
+                    if str(key).lower() == bloom.lower():
+                        bloom_row = tos_matrix.get(key, {})
+                        break
             for outcome in outcomes:
                 outcome_id = outcome.get("id", outcome.get("_id"))
                 outcome_text = outcome.get("text", outcome.get("description"))
@@ -926,6 +948,9 @@ def convert_tos_to_assigned_slots(
                         count = bloom_row.get(int(outcome_id), 0)
                     except (ValueError, TypeError):
                         pass
+                # If still not found, try outcome_* style keys
+                if count == 0 and outcome_id is not None:
+                    count = bloom_row.get(f"outcome_{outcome_id}", 0)
 
                 # Create a slot for each item
                 for _ in range(count):
