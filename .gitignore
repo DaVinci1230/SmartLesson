@@ -1,0 +1,39 @@
+# Environment variables
+.env
+*.env
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test files and outputs
+test_*.py
+test_*.docx
+test_*.pdf
+test_*.csv
+*.xlsx
+*.docx
+*.pdf
+sample_syllabus.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
