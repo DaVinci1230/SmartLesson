@@ -106,6 +106,27 @@ def regenerate_single_question(question_index: int, api_key: str):
     """Regenerate a single question using Gemini API."""
     return question_api.regenerate_question(question_index, api_key, st.session_state)
 
+def calculate_missing_slots(assigned_slots: list, generated_tqs: list) -> list:
+    """
+    Calculate which slots are missing from the generated TQS.
+    
+    Returns a list of missing slot indices that need questions.
+    """
+    if not assigned_slots or not generated_tqs:
+        return list(range(len(assigned_slots)))
+    
+    # Extract slot IDs from generated questions
+    generated_slot_ids = {q.get('slot_id') or q.get('slot_index') for q in generated_tqs}
+    
+    # Find missing slots
+    missing_slots = []
+    for i, slot in enumerate(assigned_slots):
+        slot_id = slot.get('slot_id') or i
+        if slot_id not in generated_slot_ids:
+            missing_slots.append(slot)
+    
+    return missing_slots
+
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def cached_extract_syllabus(pdf_bytes, exam_term="Midterm"):
     """Cache PDF extraction to avoid repeated processing. Caches per exam_term."""
@@ -1341,7 +1362,66 @@ with assess_tabs[4]:
                     stats = get_tqs_statistics(tqs)
                     st.session_state.tqs_stats = stats
                     
-                    st.success(f"✅ Generated {len(tqs)} test questions from {source_label}")
+                    # Check if we have partial generation
+                    expected_count = len(assigned_slots)
+                    actual_count = len(tqs)
+                    
+                    if actual_count == expected_count:
+                        st.success(f"✅ Generated {len(tqs)} test questions from {source_label}")
+                    else:
+                        missing = expected_count - actual_count
+                        missing_pct = (missing / expected_count) * 100
+                        
+                        st.warning(f"""
+                        ⚠️ **Partial Generation: {actual_count} of {expected_count} questions**
+                        
+                        - **Missing:** {missing} questions ({missing_pct:.1f}%)
+                        - **Reason:** The AI API returned fewer questions than expected
+                        - **Status:** Generation is complete but you may want to:
+                          1. **Regenerate** the missing questions using the "Regenerate Missing" button below
+                          2. **Review** the generated questions for content
+                          3. **Download** and manually add the missing {missing} question(s)
+                        
+                        *Tip: This usually happens due to API rate limiting. Try regenerating in a few moments.*
+                        """)
+                        
+                        # Store assigned_slots in session for potential regeneration
+                        st.session_state.last_assigned_slots = assigned_slots
+                        
+                        # Offer to regenerate missing questions
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("🔄 Regenerate Missing Questions", key="btn_regenerate_missing"):
+                                st.info(f"Attempting to regenerate {missing} missing question(s)...")
+                                try:
+                                    # Regenerate just the missing slots
+                                    missing_slots = calculate_missing_slots(assigned_slots, tqs)
+                                    if missing_slots:
+                                        regenerated = generate_tqs(
+                                            assigned_slots=missing_slots,
+                                            api_key=api_key,
+                                            shuffle=False
+                                        )
+                                        if regenerated:
+                                            # Merge with existing TQS
+                                            st.session_state.generated_tqs.extend(regenerated)
+                                            # Sort by question number
+                                            st.session_state.generated_tqs = sorted(
+                                                st.session_state.generated_tqs,
+                                                key=lambda q: int(q.get('question_number', 0))
+                                            )
+                                            st.success(f"✅ Regenerated {len(regenerated)} question(s)! Now have {len(st.session_state.generated_tqs)} total.")
+                                            st.rerun()
+                                        else:
+                                            st.error("❌ Failed to regenerate missing questions. Try again later.")
+                                    else:
+                                        st.info("✅ All questions are present!")
+                                except Exception as regen_error:
+                                    st.error(f"❌ Regeneration error: {str(regen_error)}")
+                        
+                        with col2:
+                            if st.button("✏️ Review & Continue Anyway", key="btn_continue_partial"):
+                                st.info("Continuing with partial TQS. You can manually add missing questions later.")
                 else:
                     st.error("❌ Failed to generate questions. Please try again.")
             

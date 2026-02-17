@@ -245,6 +245,56 @@ def interpret_api_error(error: Exception) -> Tuple[str, str]:
         return ("UNKNOWN_ERROR", f"Unexpected error: {str(error)}")
 
 
+def split_large_batches(groups: Dict[Tuple, List[Dict[str, Any]]], max_batch_size: int = 8) -> List[Tuple[Tuple, List[Dict[str, Any]]]]:
+    """
+    Split large groups into smaller sub-batches to avoid token limits and timeouts.
+    
+    Problem: When a group has 20+ questions with the same characteristics,
+    sending them all in one API call exceeds token limits and causes failures.
+    
+    Solution: Split large groups into smaller batches (max 8 questions per batch).
+    - Small groups (1-8): Send as-is
+    - Large groups (9+): Split into multiple batches of 8
+    
+    Args:
+        groups: Groups from group_slots_by_characteristics()
+        max_batch_size: Maximum questions per API call (default: 8, safe for Gemini)
+    
+    Returns:
+        List of (characteristics, batch_slots) tuples (flattened from groups)
+    
+    Example:
+        Input: {(MCQ, Apply, OutcomeA): [20 slots], (Essay, Evaluate, OutcomeB): [4 slots]}
+        Output: [(MCQ, Apply, OutcomeA, [8 slots]), (MCQ, Apply, OutcomeA, [8 slots]), 
+                 (MCQ, Apply, OutcomeA, [4 slots]), (Essay, Evaluate, OutcomeB, [4 slots])]
+    """
+    batches = []
+    original_group_count = len(groups)
+    
+    for characteristics, group_slots in groups.items():
+        qtype, bloom, outcome = characteristics
+        group_size = len(group_slots)
+        
+        if group_size <= max_batch_size:
+            # Small group - send as-is
+            batches.append((characteristics, group_slots))
+            logger.debug(f"  → Group {group_size} slots: single batch (≤{max_batch_size})")
+        else:
+            # Large group - split into smaller sub-batches
+            sub_batch_count = (group_size + max_batch_size - 1) // max_batch_size  # Ceiling division
+            logger.info(f"  ⚠️  Large group detected: {group_size} slots → splitting into {sub_batch_count} sub-batches")
+            
+            for i in range(0, group_size, max_batch_size):
+                sub_batch = group_slots[i:i + max_batch_size]
+                batches.append((characteristics, sub_batch))
+                logger.debug(f"    → Sub-batch {(i // max_batch_size) + 1}/{sub_batch_count}: {len(sub_batch)} slots")
+    
+    total_questions = sum(len(batch[1]) for batch in batches)
+    logger.info(f"Sub-batching complete: {original_group_count} groups → {len(batches)} batches ({total_questions} questions total)")
+    
+    return batches
+
+
 def group_slots_by_characteristics(slots: List[Dict[str, Any]]) -> Dict[Tuple, List[Dict[str, Any]]]:
     """
     Group slots by (question_type, bloom_level, learning_outcome).
@@ -1388,19 +1438,28 @@ def generate_tqs(
     groups = group_slots_by_characteristics(assigned_slots)
     
     logger.info(f"Created {len(groups)} groups for batch generation")
-    logger.info(f"Expected API calls: {len(groups)} (reduction from {len(assigned_slots)} single calls)")
     
-    # Generate questions for each group with RETRY LOGIC
+    # =====================================================================
+    # SUB-BATCH LARGE GROUPS (NEW optimization for large TOS)
+    # =====================================================================
+    # When a group has 9+ questions, split into smaller batches (max 8 per batch)
+    # This prevents token overflow and timeouts with Gemini API
+    logger.info("Optimizing large batches (splitting groups >8 questions into smaller batches)...")
+    batches = split_large_batches(groups, max_batch_size=8)
+    
+    logger.info(f"Total API calls needed: {len(batches)} (grouped + sub-batched)")
+    
+    # Generate questions for each batch with RETRY LOGIC
     generated_questions = []
     failed_groups = []
     MAX_RETRIES = 2
     
-    for group_num, (characteristics, batch_slots) in enumerate(groups.items(), 1):
+    for batch_num, (characteristics, batch_slots) in enumerate(batches, 1):
         qtype, bloom, outcome = characteristics
         num_slots = len(batch_slots)
         
-        logger.info(f"\n[Group {group_num}/{len(groups)}] {qtype} / {bloom} / {str(outcome)[:40]}...")
-        logger.info(f"  Expected questions: {num_slots}")
+        logger.info(f"\n[Batch {batch_num}/{len(batches)}] {qtype} / {bloom} / {str(outcome)[:40]}...")
+        logger.info(f"  Expected questions: {num_slots} (sub-batch of group)")
         
         batch_questions = None
         last_error = None
@@ -1561,25 +1620,34 @@ def generate_tqs(
     # Validate all required fields are present
     logger.info("Validating all questions have required metadata...")
     
-    # ===== SAFETY ASSERTION: Guarantee counts match =====
+    # ===== SAFETY CHECK: Count mismatch handling =====
     if len(generated_questions) != expected_question_count:
         missing = expected_question_count - len(generated_questions)
-        error_msg = (
-            f"\n🔥 ASSERTION FAILED: Question count mismatch!\n"
-            f"Expected: {expected_question_count} questions\n"
-            f"Got: {len(generated_questions)} questions\n"
-            f"Missing: {missing} questions\n\n"
-            f"This is a CRITICAL data integrity issue. The TQS is incomplete.\n"
-            f"See application logs above for details about which batches failed.\n"
-        )
-        logger.error(error_msg)
-        raise AssertionError(
-            f"Generated {len(generated_questions)} questions but expected {expected_question_count}. "
-            f"Missing {missing} questions. This indicates a generation failure. "
-            f"Review logs for details."
-        )
-    
-    logger.info(f"✓ ASSERTION PASSED: Generated {expected_question_count} questions as expected")
+        missing_pct = (missing / expected_question_count) * 100
+        
+        # Determine severity based on percentage of missing questions
+        if missing_pct >= 10:  # 10% or more missing = critical
+            error_msg = (
+                f"\n🔥 CRITICAL: Question count mismatch!\n"
+                f"Expected: {expected_question_count} questions\n"
+                f"Got: {len(generated_questions)} questions\n"
+                f"Missing: {missing} questions ({missing_pct:.1f}%)\n\n"
+                f"Too many questions were lost during generation.\n"
+                f"Try retrying the generation, or reducing the number of total items.\n"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(
+                f"❌ Generation incomplete: {missing} of {expected_question_count} questions missing ({missing_pct:.1f}%). "
+                f"This is too significant to proceed. Try again."
+            )
+        else:  # Less than 10% missing = warning, allow to continue
+            logger.warning(
+                f"\n⚠️  PARTIAL GENERATION: {missing} of {expected_question_count} questions missing ({missing_pct:.1f}%)\n"
+                f"Generated {len(generated_questions)} questions successfully.\n"
+                f"Continuing with partial TQS. You may want to regenerate the missing questions.\n"
+            )
+    else:
+        logger.info(f"✓ Perfect generation: {expected_question_count} questions generated successfully")
     
     try:
         validate_tqs_before_stats(generated_questions)
