@@ -37,6 +37,41 @@ from typing import Dict, Tuple, Any
 logger = logging.getLogger(__name__)
 
 # ======================================================
+# AUTH HELPERS
+# ======================================================
+AUTH_USERNAME = "admin"
+AUTH_PASSWORD = "smart123"
+
+def init_auth_state() -> None:
+    if "is_authenticated" not in st.session_state:
+        st.session_state.is_authenticated = False
+    if "login_error" not in st.session_state:
+        st.session_state.login_error = ""
+
+def authenticate_user(username: str, password: str) -> bool:
+    return username == AUTH_USERNAME and password == AUTH_PASSWORD
+
+def render_login_page() -> None:
+    st.title("SmartLesson Login")
+    st.caption("Please sign in to continue.")
+
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+    if submitted:
+        if authenticate_user(username, password):
+            st.session_state.is_authenticated = True
+            st.session_state.login_error = ""
+            st.rerun()
+        else:
+            st.session_state.login_error = "Invalid username or password."
+
+    if st.session_state.login_error:
+        st.error(st.session_state.login_error)
+
+# ======================================================
 # SECRETS HELPERS
 # ======================================================
 def get_gemini_api_key() -> str | None:
@@ -82,6 +117,17 @@ st.set_page_config(
     page_title="SmartLesson",
     layout="wide"
 )
+
+init_auth_state()
+
+if not st.session_state.is_authenticated:
+    render_login_page()
+    st.stop()
+
+if st.sidebar.button("Logout"):
+    st.session_state.is_authenticated = False
+    st.session_state.login_error = ""
+    st.rerun()
 
 st.title("📘 SmartLesson")
 st.caption("Lesson Planning | TOS & Test Question Generator")
